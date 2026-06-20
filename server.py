@@ -46,6 +46,8 @@ class Player:
         self.angle = 0.0
         self.alive = True
         self.lock = threading.Lock()
+        self.bonus_effect = None       # активный эффект бонуса
+        self.bonus_double_used = False # для double_shot: был ли первый выстрел
 
     def send(self, msg):
         try:
@@ -71,38 +73,40 @@ class GameServer:
         self.lock = threading.RLock()
         self.log_lines = []
         self.spawn_positions = {}     # id -> (x, y)
+        self.spawn_attempts = 0
+        self.restart_votes = set()
+        self._turn_timer = None
+        self.bonus = None              # {"type": str, "x": float, "y": float} or None
+        self._last_bonus_type = None   # для ограничения 2 раз подряд
 
     # ---------------- Поле и препятствия ----------------
 
-    def gen_obstacles(self):
-        shapes = []
-        n = random.randint(8, 14)
-        for _ in range(n):
-            kind = random.choice(["square", "circle"])
-            cx = random.randint(120, S.WIDTH - 120)
-            cy = random.randint(120, S.HEIGHT - 120)
-            if kind == "square":
-                size = random.randint(35, 80)
-                shapes.append(("square", cx, cy, size))
-            else:
-                r = random.randint(20, 45)
-                shapes.append(("circle", cx, cy, r))
-
+    def gen_obstacles(self, target_density=None):
+        if target_density is None:
+            target_density = S.OBSTACLE_FILL
+        total_cells = S.GRID_W * S.GRID_H
+        target = int(total_cells * target_density)
         grid = [[False] * S.GRID_W for _ in range(S.GRID_H)]
-        for shp in shapes:
-            kind = shp[0]
+        filled = 0
+        for _ in range(500):
+            if filled >= target:
+                break
+            kind = random.choice(["square", "circle", "rect"])
+            cx = random.randint(0, S.WIDTH)
+            cy = random.randint(0, S.HEIGHT)
             if kind == "square":
-                _, cx, cy, size = shp
-                half = size / 2
-                x0 = int((cx - half) // S.GRID_CELL)
-                x1 = int((cx + half) // S.GRID_CELL)
-                y0 = int((cy - half) // S.GRID_CELL)
-                y1 = int((cy + half) // S.GRID_CELL)
+                size = random.randint(40, 160)
+                x0 = int((cx - size / 2) // S.GRID_CELL)
+                x1 = int((cx + size / 2) // S.GRID_CELL)
+                y0 = int((cy - size / 2) // S.GRID_CELL)
+                y1 = int((cy + size / 2) // S.GRID_CELL)
                 for gy in range(max(0, y0), min(S.GRID_H, y1 + 1)):
                     for gx in range(max(0, x0), min(S.GRID_W, x1 + 1)):
-                        grid[gy][gx] = True
-            else:
-                _, cx, cy, r = shp
+                        if not grid[gy][gx]:
+                            grid[gy][gx] = True
+                            filled += 1
+            elif kind == "circle":
+                r = random.randint(30, 100)
                 x0 = int((cx - r) // S.GRID_CELL)
                 x1 = int((cx + r) // S.GRID_CELL)
                 y0 = int((cy - r) // S.GRID_CELL)
@@ -111,8 +115,21 @@ class GameServer:
                     for gx in range(max(0, x0), min(S.GRID_W, x1 + 1)):
                         px = gx * S.GRID_CELL + S.GRID_CELL / 2
                         py = gy * S.GRID_CELL + S.GRID_CELL / 2
-                        if (px - cx) ** 2 + (py - cy) ** 2 <= r * r:
+                        if (px - cx) ** 2 + (py - cy) ** 2 <= r * r and not grid[gy][gx]:
                             grid[gy][gx] = True
+                            filled += 1
+            else:
+                w = random.randint(40, 200)
+                h = random.randint(40, 140)
+                x0 = int((cx - w / 2) // S.GRID_CELL)
+                x1 = int((cx + w / 2) // S.GRID_CELL)
+                y0 = int((cy - h / 2) // S.GRID_CELL)
+                y1 = int((cy + h / 2) // S.GRID_CELL)
+                for gy in range(max(0, y0), min(S.GRID_H, y1 + 1)):
+                    for gx in range(max(0, x0), min(S.GRID_W, x1 + 1)):
+                        if not grid[gy][gx]:
+                            grid[gy][gx] = True
+                            filled += 1
         self.grid = grid
 
     def cell_free(self, gx, gy):
@@ -122,6 +139,7 @@ class GameServer:
 
     def find_spawn(self, existing):
         margin = 60
+        min_dist_sq = (2 * S.GRID_UNIT_PX) ** 2
         for _ in range(500):
             x = random.uniform(margin, S.WIDTH - margin)
             y = random.uniform(margin, S.HEIGHT - margin)
@@ -138,13 +156,12 @@ class GameServer:
                 continue
             too_close = False
             for (ex, ey) in existing:
-                if (ex - x) ** 2 + (ey - y) ** 2 < (S.PLAYER_RADIUS * 6) ** 2:
+                if (ex - x) ** 2 + (ey - y) ** 2 < min_dist_sq:
                     too_close = True
                     break
             if too_close:
                 continue
             return x, y
-        # fallback
         return S.WIDTH / 2, S.HEIGHT / 2
 
     # ---------------- Жизненный цикл партии ----------------
@@ -160,6 +177,7 @@ class GameServer:
                 return
             self.gen_obstacles()
             self.spawn_positions = {}
+            self.spawn_attempts = 0
             grid_bytes = S.grid_to_bytes(self.grid)
             grid_b64 = base64.b64encode(grid_bytes).decode("ascii")
             msg = {
@@ -174,6 +192,15 @@ class GameServer:
                 p.send(msg)
             self.log("Выберите стартовую позицию на поле.")
 
+    def _reset_all_spawns(self, msg_text):
+        self.spawn_positions = {}
+        self.broadcast({"type": "error", "msg": msg_text})
+        grid_bytes = S.grid_to_bytes(self.grid)
+        grid_b64 = base64.b64encode(grid_bytes).decode("ascii")
+        for p in list(self.players.values()):
+            p.send({"type": "choose_spawn", "grid_b64": grid_b64,
+                     "players": [{"id": pp.id, "name": pp.name} for pp in self.players.values()]})
+
     def handle_spawn(self, p, x, y):
         with self.lock:
             if self.started or p.id in self.spawn_positions:
@@ -182,16 +209,9 @@ class GameServer:
             y = max(20, min(S.HEIGHT - 20, float(y)))
             gx, gy = int(x // S.GRID_CELL), int(y // S.GRID_CELL)
             if 0 <= gx < S.GRID_W and 0 <= gy < S.GRID_H and self.grid[gy][gx]:
-                p.send({"type": "error", "msg": "Нельзя стоять на препятствии!"})
+                self.log(f"{p.name}: нельзя стоять на препятствии! Расстановка сброшена.")
+                self._reset_all_spawns(f"{p.name} встал на препятствие — расстановка сброшена.")
                 return
-            for op in self.players.values():
-                if op.id == p.id:
-                    continue
-                if op.id in self.spawn_positions:
-                    ox, oy = self.spawn_positions[op.id]
-                    if (ox - x) ** 2 + (oy - y) ** 2 < (S.PLAYER_RADIUS * 6) ** 2:
-                        p.send({"type": "error", "msg": "Слишком близко к другому игроку!"})
-                        return
             self.spawn_positions[p.id] = (x, y)
             self.log(f"{p.name} выбрал позицию.")
             ready = [pid for pid in self.players if pid in self.spawn_positions]
@@ -199,21 +219,64 @@ class GameServer:
                 self._begin_game()
 
     def _begin_game(self):
+        min_dist_sq = (2 * S.GRID_UNIT_PX) ** 2
+        positions = list(self.spawn_positions.values())
+        if len(positions) >= 2:
+            too_close = False
+            for i in range(len(positions)):
+                for j in range(i + 1, len(positions)):
+                    ax, ay = positions[i]
+                    bx, by = positions[j]
+                    if (ax - bx) ** 2 + (ay - by) ** 2 < min_dist_sq:
+                        too_close = True
+                        break
+                if too_close:
+                    break
+            if too_close:
+                self.spawn_attempts += 1
+                self.log(f"Слишком близко! Попытка {self.spawn_attempts}/3.")
+                if self.spawn_attempts >= 3:
+                    self.log("3 попытки исчерпаны — авто-расстановка.")
+                    self.spawn_attempts = 0
+                    self._auto_spawn()
+                    return
+                self._reset_all_spawns(f"Слишком близко! Попытка {self.spawn_attempts}/3. Выберите заново.")
+                return
+        self._finalize_start()
+
+    def _finalize_start(self):
         for p in self.players.values():
             x, y = self.spawn_positions.get(p.id, (S.WIDTH / 2, S.HEIGHT / 2))
             p.x, p.y = x, y
             p.hp = S.MAX_HP
             p.alive = True
             p.angle = random.uniform(-math.pi, math.pi)
+            p.bonus_effect = None
+            p.bonus_double_used = False
         self.order = list(self.players.keys())
         random.shuffle(self.order)
         self.turn_idx = 0
         self.round_no = 1
         self.started = True
         self.game_over = False
+        self.spawn_attempts = 0
         self.spawn_positions = {}
+        self.bonus = None
+        self._last_bonus_type = None
         self.log("Игра началась! Игроков: %d" % len(self.players))
+        self._start_turn_timer()
         self.broadcast_state()
+
+    def _auto_spawn(self):
+        existing = []
+        auto_pos = {}
+        for p in self.players.values():
+            x, y = self.find_spawn(existing)
+            auto_pos[p.id] = (x, y)
+            existing.append((x, y))
+        self.spawn_positions = auto_pos
+        self.log("Авто-расстановка выполнена.")
+        self._finalize_start()
 
     def alive_ids_in_order(self):
         return [pid for pid in self.order if pid in self.players and self.players[pid].alive]
@@ -225,6 +288,30 @@ class GameServer:
         self.turn_idx %= len(ids)
         return ids[self.turn_idx]
 
+    def _start_turn_timer(self):
+        self._cancel_turn_timer()
+        self._turn_started_at = time.time()
+        self._turn_timer = threading.Timer(S.TURN_TIMEOUT, self._on_turn_timeout)
+        self._turn_timer.daemon = True
+        self._turn_timer.start()
+
+    def _cancel_turn_timer(self):
+        if self._turn_timer is not None:
+            self._turn_timer.cancel()
+        self._turn_timer = None
+        self._turn_started_at = 0
+
+    def _on_turn_timeout(self):
+        with self.lock:
+            if not self.started or self.game_over:
+                return
+            pid = self.current_turn_id()
+            if pid and pid in self.players:
+                self.log(f"Время вышло — ход {self.players[pid].name} пропущен.")
+            self.advance_turn()
+            self._start_turn_timer()
+            self.broadcast_state()
+
     def advance_turn(self):
         ids = self.alive_ids_in_order()
         if len(ids) <= 1:
@@ -233,8 +320,60 @@ class GameServer:
         if self.turn_idx == 0:
             self.round_no += 1
             for pid in ids:
-                self.players[pid].angle = random.uniform(-math.pi, math.pi)
+                pp = self.players[pid]
+                if pp.bonus_effect == "angle_reset":
+                    pp.angle = 0.0
+                    pp.bonus_effect = None
+                    self.log(f"{pp.name}: сброс угла до 0°!")
+                else:
+                    pp.angle = random.uniform(-math.pi, math.pi)
             self.log("Раунд %d: новые углы координатных систем." % self.round_no)
+            if self.round_no >= 2 and self.round_no % 2 == 0 and self.bonus is None:
+                self._spawn_bonus()
+
+    def _spawn_bonus(self):
+        for _ in range(200):
+            x = random.uniform(S.BONUS_SIZE, S.WIDTH - S.BONUS_SIZE)
+            y = random.uniform(S.BONUS_SIZE, S.HEIGHT - S.BONUS_SIZE)
+            gx, gy = int(x // S.GRID_CELL), int(y // S.GRID_CELL)
+            if 0 <= gx < S.GRID_W and 0 <= gy < S.GRID_H and self.grid[gy][gx]:
+                continue
+            too_close = False
+            for p in self.players.values():
+                if (p.x - x) ** 2 + (p.y - y) ** 2 < (2 * S.GRID_UNIT_PX) ** 2:
+                    too_close = True
+                    break
+            if too_close:
+                continue
+            available = [t for t in S.BONUS_TYPES if t != self._last_bonus_type]
+            btype = random.choice(available)
+            self.bonus = {"type": btype, "x": x, "y": y}
+            self._last_bonus_type = btype
+            self.log(f"Бонус появился: {btype}!")
+            return
+
+    def _try_pickup_bonus(self, px, py):
+        if self.bonus is None:
+            return
+        bx, by = self.bonus["x"], self.bonus["y"]
+        if (px - bx) ** 2 + (py - by) ** 2 <= S.BONUS_PICKUP_RADIUS ** 2:
+            self._apply_bonus(self.bonus["type"], self.current_turn_id())
+            self.bonus = None
+
+    def _try_shot_bonus(self, wx, wy):
+        if self.bonus is None:
+            return
+        bx, by = self.bonus["x"], self.bonus["y"]
+        if (wx - bx) ** 2 + (wy - by) ** 2 <= S.BONUS_PICKUP_RADIUS ** 2:
+            self._apply_bonus(self.bonus["type"], self.current_turn_id())
+            self.bonus = None
+
+    def _apply_bonus(self, btype, pid):
+        p = self.players.get(pid)
+        if not p:
+            return
+        p.bonus_effect = btype
+        self.log(f"{p.name} подобрал бонус: {btype}!")
 
     # ---------------- Трассировка снаряда ----------------
 
@@ -244,7 +383,12 @@ class GameServer:
         step_grid = S.TRAJ_STEP / S.GRID_UNIT_PX
         max_grid = S.TRAJ_MAXX / S.GRID_UNIT_PX
         steps = int(max_grid / step_grid)
+        dmg = 2 if shooter.bonus_effect == "damage" else 1
+        if shooter.bonus_effect == "damage":
+            shooter.bonus_effect = None
         x = 0.0
+        prev_wx, prev_wy = shooter.x, shooter.y
+        arc_len_px = 0.0
         for _ in range(steps):
             x_eval = -x if flip else x
             try:
@@ -253,43 +397,102 @@ class GameServer:
                 break
             if not math.isfinite(y):
                 break
-            px_local = x_eval * S.GRID_UNIT_PX
-            py_local = y * S.GRID_UNIT_PX
+            h = 0.01
+            try:
+                y_plus = fn(x_eval + h)
+                y_minus = fn(x_eval - h)
+                dy_dx = (y_plus - y_minus) / (2 * h)
+            except Exception:
+                dy_dx = 0.0
+            tangent_len = math.sqrt(1 + dy_dx * dy_dx)
+            nx_local = -dy_dx / tangent_len
+            ny_local = 1.0 / tangent_len
+            A_d = S.NOISE_A0 + S.NOISE_ALPHA * arc_len_px
+            offset = random.gauss(0, A_d) / S.GRID_UNIT_PX
+            x_noisy = x_eval + nx_local * offset
+            y_noisy = y + ny_local * offset
+            px_local = x_noisy * S.GRID_UNIT_PX
+            py_local = y_noisy * S.GRID_UNIT_PX
             dx, dy = S.rotate_point(px_local, py_local, shooter.angle)
             wx = shooter.x + dx
             wy = shooter.y - dy
             points.append((wx, wy))
+            arc_len_px += math.sqrt((wx - prev_wx) ** 2 + (wy - prev_wy) ** 2)
 
-            if wx < 0 or wx >= S.WIDTH or wy < 0 or wy >= S.HEIGHT:
+            if wx < 0 or wx >= S.WIDTH:
+                prev_wx, prev_wy = wx, wy
                 break
 
-            # столкновение с игроком (включая себя)
+            self._try_shot_bonus(wx, wy)
+
+            ax, ay = prev_wx, prev_wy
+            bx, by = wx, wy
+            seg_dx, seg_dy = bx - ax, by - ay
+            seg_len_sq = seg_dx * seg_dx + seg_dy * seg_dy
+
             hit_someone = False
+            hit_pos = None
+            hit_other = None
+            best_t = 2.0
             for other in self.players.values():
-                if not other.alive:
+                if not other.alive or other.id == shooter.id:
                     continue
-                if other.id == shooter.id:
-                    continue
-                d2 = (other.x - wx) ** 2 + (other.y - wy) ** 2
-                if d2 <= S.PLAYER_RADIUS ** 2:
-                    other.hp -= 1
+                if seg_len_sq < 1e-10:
+                    d2 = (other.x - bx) ** 2 + (other.y - by) ** 2
+                    t = 0.0
+                else:
+                    t = max(0.0, min(1.0, ((other.x - ax) * seg_dx + (other.y - ay) * seg_dy) / seg_len_sq))
+                    cx = ax + t * seg_dx
+                    cy = ay + t * seg_dy
+                    d2 = (other.x - cx) ** 2 + (other.y - cy) ** 2
+                if d2 <= S.PLAYER_RADIUS ** 2 and t < best_t:
+                    best_t = t
+                    hit_other = other
+                    if seg_len_sq < 1e-10:
+                        hit_pos = (bx, by)
+                    else:
+                        cx = ax + t * seg_dx
+                        cy = ay + t * seg_dy
+                        hit_pos = (cx, cy)
+            if hit_other:
+                other = hit_other
+                wx, wy = hit_pos
+                if other.bonus_effect == "shield":
+                    other.bonus_effect = None
+                    result = {"kind": "shield", "target": other.id, "pos": [wx, wy]}
+                    self.log(f"{other.name} заблокировал попадание щитом!")
+                else:
+                    other.hp -= dmg
                     if other.hp <= 0:
                         other.alive = False
                     result = {"kind": "player", "target": other.id, "pos": [wx, wy]}
                     self.log(f"{shooter.name} попал по {other.name}! HP {other.name}: {max(other.hp,0)}")
-                    hit_someone = True
-                    break
+                hit_someone = True
             if hit_someone:
                 break
 
-            # столкновение с препятствием
-            gx, gy = int(wx // S.GRID_CELL), int(wy // S.GRID_CELL)
+            gx, gy = int(bx // S.GRID_CELL), int(by // S.GRID_CELL)
+            hit_obstacle = False
             if 0 <= gx < S.GRID_W and 0 <= gy < S.GRID_H and self.grid[gy][gx]:
-                self.explode(wx, wy)
-                result = {"kind": "obstacle", "target": None, "pos": [wx, wy]}
+                hit_obstacle = True
+            if not hit_obstacle and seg_len_sq > 1e-10:
+                n_steps = max(1, int(math.sqrt(seg_len_sq) / S.GRID_CELL))
+                for si in range(1, n_steps + 1):
+                    t = si / n_steps
+                    sx = ax + t * seg_dx
+                    sy = ay + t * seg_dy
+                    gx, gy = int(sx // S.GRID_CELL), int(sy // S.GRID_CELL)
+                    if 0 <= gx < S.GRID_W and 0 <= gy < S.GRID_H and self.grid[gy][gx]:
+                        hit_obstacle = True
+                        bx, by = sx, sy
+                        break
+            if hit_obstacle:
+                self.explode(bx, by)
+                result = {"kind": "obstacle", "target": None, "pos": [bx, by]}
                 self.log(f"{shooter.name} разрушил часть препятствия.")
                 break
 
+            prev_wx, prev_wy = wx, wy
             x += step_grid
 
         return points, result
@@ -316,11 +519,14 @@ class GameServer:
             "started": self.started,
             "round": self.round_no,
             "turn": self.current_turn_id() if self.started else None,
+            "turn_deadline": self._turn_started_at + S.TURN_TIMEOUT if self.started else 0,
             "players": [
                 {"id": p.id, "name": p.name, "x": p.x, "y": p.y,
-                 "hp": p.hp, "angle": p.angle, "alive": p.alive}
+                 "hp": p.hp, "angle": p.angle, "alive": p.alive,
+                 "bonus_effect": p.bonus_effect}
                 for p in self.players.values()
             ],
+            "bonus": self.bonus,
             "grid_b64": grid_b64,
             "log": self.log_lines[-1] if self.log_lines else "",
         }
@@ -335,11 +541,31 @@ class GameServer:
         alive = [p for p in self.players.values() if p.alive]
         if self.started and not self.game_over and len(alive) <= 1:
             self.game_over = True
+            self._cancel_turn_timer()
+            self.restart_votes = set()
             winner = alive[0].id if alive else None
             self.broadcast({"type": "game_over", "winner": winner})
             self.log("Игра окончена. Победитель: %s" % (alive[0].name if alive else "никто"))
 
+    def handle_restart_vote(self, p):
+        with self.lock:
+            if not self.game_over:
+                return
+            self.restart_votes.add(p.id)
+            names = [self.players[pid].name for pid in self.restart_votes if pid in self.players]
+            self.log(f"{p.name} хочет реванш ({len(self.restart_votes)}/{len(self.players)}).")
+            if len(self.restart_votes) >= len(self.players):
+                self.restart_votes = set()
+                self.game_over = False
+                self.log("Все согласны! Новый раунд.")
+                self.start_game()
+            else:
+                self.broadcast({"type": "restart_status",
+                                "voted": len(self.restart_votes),
+                                "total": len(self.players)})
+
     def reset_game(self):
+        self._cancel_turn_timer()
         self.players.clear()
         self.next_id = 1
         self.order = []
@@ -348,7 +574,19 @@ class GameServer:
         self.grid = [[False] * S.GRID_W for _ in range(S.GRID_H)]
         self.started = False
         self.game_over = False
+        self.bonus = None
+        self._last_bonus_type = None
         self.log("Сервер сброшен. Ожидание новых игроков.")
+
+    def _apply_turn_effects(self, p):
+        if p.bonus_effect == "angle_reset":
+            p.angle = 0.0
+            self.log(f"{p.name}: сброс угла до 0°!")
+            p.bonus_effect = None
+        if p.bonus_effect == "shield":
+            p.bonus_effect = None
+        if p.bonus_effect == "double_shot":
+            p.bonus_double_used = False
 
     def handle_fire(self, p, expr, flip=False):
         with self.lock:
@@ -358,12 +596,17 @@ class GameServer:
             if self.current_turn_id() != p.id:
                 p.send({"type": "error", "msg": "Сейчас не ваш ход."})
                 return
+            if p.bonus_effect == "double_shot" and p.bonus_double_used:
+                pass
+            else:
+                self._apply_turn_effects(p)
             try:
                 fn = S.compile_function(expr)
             except S.UnsafeExpression as e:
                 p.send({"type": "error", "msg": f"Некорректная функция: {e}"})
                 return
 
+            self._cancel_turn_timer()
             points, result = self.simulate_shot(p, fn, flip=flip)
             self.broadcast({
                 "type": "shot",
@@ -372,9 +615,59 @@ class GameServer:
                 "points": points,
                 "result": result,
             })
+            advance = True
+            if p.bonus_effect == "double_shot":
+                if not p.bonus_double_used:
+                    p.bonus_double_used = True
+                    advance = False
+                else:
+                    p.bonus_effect = None
+                    p.bonus_double_used = False
+            if advance:
+                self.advance_turn()
+            self.check_game_over()
+            if self.started and not self.game_over:
+                self._start_turn_timer()
+            self.broadcast_state()
+            if not self.started or self.game_over:
+                self._cancel_turn_timer()
+
+    def handle_move(self, p, dx, dy):
+        with self.lock:
+            if not self.started or self.game_over:
+                p.send({"type": "error", "msg": "Игра ещё не началась."})
+                return
+            if self.current_turn_id() != p.id:
+                p.send({"type": "error", "msg": "Сейчас не ваш ход."})
+                return
+            self._apply_turn_effects(p)
+            d2 = dx * dx + dy * dy
+            if d2 >= 8:
+                p.send({"type": "error", "msg": "Слишком далеко! x^2 + y^2 < 8"})
+                return
+            local_px = dx * S.GRID_UNIT_PX
+            local_py = dy * S.GRID_UNIT_PX
+            wx, wy = S.rotate_point(local_px, local_py, p.angle)
+            nx = p.x + wx
+            ny = p.y - wy
+            if nx < 0 or nx >= S.WIDTH or ny < 0 or ny >= S.HEIGHT:
+                p.send({"type": "error", "msg": "Выход за границы поля!"})
+                return
+            gx, gy = int(nx // S.GRID_CELL), int(ny // S.GRID_CELL)
+            if 0 <= gx < S.GRID_W and 0 <= gy < S.GRID_H and self.grid[gy][gx]:
+                p.send({"type": "error", "msg": "Нельзя войти в препятствие!"})
+                return
+            self.log(f"{p.name} переместился на ({dx:.1f}, {dy:.1f}).")
+            self._cancel_turn_timer()
+            p.x, p.y = nx, ny
+            self._try_pickup_bonus(nx, ny)
             self.advance_turn()
             self.check_game_over()
+            if self.started and not self.game_over:
+                self._start_turn_timer()
             self.broadcast_state()
+            if not self.started or self.game_over:
+                self._cancel_turn_timer()
 
     def client_thread(self, conn, addr):
         with self.lock:
@@ -421,6 +714,10 @@ class GameServer:
                     self.handle_fire(p, msg.get("expr", ""), flip=msg.get("flip", False))
                 elif msg.get("type") == "spawn":
                     self.handle_spawn(p, msg.get("x", 0), msg.get("y", 0))
+                elif msg.get("type") == "move":
+                    self.handle_move(p, float(msg.get("dx", 0)), float(msg.get("dy", 0)))
+                elif msg.get("type") == "restart_vote":
+                    self.handle_restart_vote(p)
         except Exception:
             pass
         finally:
