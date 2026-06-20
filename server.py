@@ -464,6 +464,8 @@ class GameServer:
             if hit_other:
                 other = hit_other
                 wx, wy = hit_pos
+                if points:
+                    points[-1] = (wx, wy)
                 if other.bonus_effect == "shield":
                     other.bonus_effect = None
                     result = {"kind": "shield", "target": other.id, "pos": [wx, wy]}
@@ -494,6 +496,8 @@ class GameServer:
                         bx, by = sx, sy
                         break
             if hit_obstacle:
+                if points:
+                    points[-1] = (bx, by)
                 self.explode(bx, by)
                 result = {"kind": "obstacle", "target": None, "pos": [bx, by]}
                 self.log(f"{shooter.name} разрушил часть препятствия.")
@@ -672,8 +676,8 @@ class GameServer:
             p.x, p.y = nx, ny
             p.moved_this_turn = True
             self._try_pickup_bonus(nx, ny)
-            self.broadcast_state()
             self._start_turn_timer()
+            self.broadcast_state()
 
     def handle_end_turn(self, p):
         with self.lock:
@@ -755,6 +759,11 @@ class GameServer:
                     else:
                         self.check_game_over()
                         self.broadcast_state()
+                elif self.game_over and not self.players:
+                    try:
+                        self.reset_game()
+                    except Exception as e:
+                        self.log(f"Ошибка сброса: {e}")
             try:
                 conn.close()
             except Exception:
