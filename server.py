@@ -59,9 +59,11 @@ class Player:
 
 
 class GameServer:
-    def __init__(self, port, target_players):
+    def __init__(self, port, target_players, bind_host="0.0.0.0", turn_timeout=None):
         self.port = port
         self.target_players = target_players
+        self.bind_host = bind_host
+        self.turn_timeout = turn_timeout if turn_timeout is not None else S.TURN_TIMEOUT
         self.players = {}             # id -> Player
         self.next_id = 1
         self.order = []               # turn order (list of ids), alive only, rotated each shot
@@ -291,7 +293,7 @@ class GameServer:
     def _start_turn_timer(self):
         self._cancel_turn_timer()
         self._turn_started_at = time.time()
-        self._turn_timer = threading.Timer(S.TURN_TIMEOUT, self._on_turn_timeout)
+        self._turn_timer = threading.Timer(self.turn_timeout, self._on_turn_timeout)
         self._turn_timer.daemon = True
         self._turn_timer.start()
 
@@ -519,7 +521,7 @@ class GameServer:
             "started": self.started,
             "round": self.round_no,
             "turn": self.current_turn_id() if self.started else None,
-            "turn_deadline": self._turn_started_at + S.TURN_TIMEOUT if self.started else 0,
+            "turn_deadline": self._turn_started_at + self.turn_timeout if self.started else 0,
             "players": [
                 {"id": p.id, "name": p.name, "x": p.x, "y": p.y,
                  "hp": p.hp, "angle": p.angle, "alive": p.alive,
@@ -739,13 +741,75 @@ class GameServer:
             except Exception:
                 pass
 
+    @staticmethod
+    def _get_local_ip():
+        """Определяет локальный IP-адрес (для LAN)."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.5)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+
+    @staticmethod
+    def _get_public_ip():
+        """Пытается определить внешний (публичный) IP-адрес."""
+        import urllib.request
+        services = [
+            "https://api.ipify.org?format=text",
+            "https://icanhazip.com",
+            "https://ifconfig.me/ip",
+            "https://checkip.amazonaws.com",
+        ]
+        for url in services:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "WormixServer/1.0"})
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    ip = resp.read().decode("utf-8").strip()
+                    if ip and all(c in "0123456789." for c in ip):
+                        return ip
+            except Exception:
+                continue
+        return None
+
     def run(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("0.0.0.0", self.port))
+        srv.bind((self.bind_host, self.port))
         srv.listen(8)
         srv.settimeout(1.0)
-        print(f"Сервер запущен на порту {self.port}. Жду {self.target_players} игрок(ов)...")
+
+        local_ip = self._get_local_ip()
+
+        print("=" * 60)
+        print("  Wormix Game Server")
+        print("=" * 60)
+        print(f"  Порт:           {self.port}")
+        print(f"  Привязка:       {self.bind_host}")
+        print(f"  Игроков:        {self.target_players}")
+        print(f"  Локальный IP:   {local_ip}")
+        print("=" * 60)
+        print()
+        print("  Подключение (на этом же компьютере):")
+        print(f"    python client.py 127.0.0.1 {self.port} Имя")
+        print()
+        print("  Подключение (в локальной сети):")
+        print(f"    python client.py {local_ip} {self.port} Имя")
+        print()
+
+        if self.bind_host == "0.0.0.0":
+            public_ip = self._get_public_ip()
+            if public_ip:
+                print(f"  Публичный IP:   {public_ip}")
+                print(f"  Через интернет:")
+                print(f"    python client.py {public_ip} {self.port} Имя")
+                print()
+                print(f"  (не забудьте открыть порт {self.port} в файрволе/роутере)")
+                print()
+        print("=" * 60)
         try:
             while True:
                 try:
@@ -762,11 +826,32 @@ class GameServer:
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=S.PROTOCOL_PORT_DEFAULT)
-    ap.add_argument("--players", type=int, default=2, help="число игроков для автостарта")
+    ap = argparse.ArgumentParser(
+        description="Сервер сетевой артиллерийской игры Wormix",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Примеры запуска:
+  python server.py                          # запуск на всех интерфейсах
+  python server.py --local                  # только локальная сеть (127.0.0.1)
+  python server.py --port 7777              # свой порт
+  python server.py --turn-timeout 30        # 30 секунд на ход
+  python server.py --players 4              # ждать 4 игрока перед стартом
+        """
+    )
+    ap.add_argument("--port", type=int, default=S.PROTOCOL_PORT_DEFAULT,
+                    help="порт сервера (по умолчанию: %(default)s)")
+    ap.add_argument("--players", type=int, default=2,
+                    help="число игроков для автостарта (2-%d, по умолчанию: %%(default)s)" % S.MAX_PLAYERS)
+    ap.add_argument("--bind", type=str, default="0.0.0.0",
+                    help="IP-адрес для привязки (по умолчанию: 0.0.0.0 — все интерфейсы)")
+    ap.add_argument("--local", action="store_true",
+                    help="только локальная сеть (привязка к 127.0.0.1, без публичного IP)")
+    ap.add_argument("--turn-timeout", type=int, default=S.TURN_TIMEOUT,
+                    help="время на ход в секундах (по умолчанию: %%(default)s)")
     args = ap.parse_args()
-    gs = GameServer(args.port, max(2, min(S.MAX_PLAYERS, args.players)))
+    bind_host = "127.0.0.1" if args.local else args.bind
+    gs = GameServer(args.port, max(2, min(S.MAX_PLAYERS, args.players)),
+                    bind_host=bind_host, turn_timeout=args.turn_timeout)
     gs.run()
 
 
