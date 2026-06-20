@@ -135,6 +135,36 @@ class TextInputBox:
         surf.blit(self.font.render(txt, True, col), (self.rect.x + 10, self.rect.y + 8))
 
 
+def _compute_preview(expr, px, py, angle, flip):
+    try:
+        fn = S.compile_function(expr)
+    except Exception:
+        return []
+    points = [(int(px), int(py))]
+    step_grid = S.TRAJ_STEP / S.GRID_UNIT_PX
+    max_grid = S.TRAJ_MAXX / S.GRID_UNIT_PX
+    steps = int(max_grid / step_grid)
+    x = 0.0
+    for _ in range(steps):
+        x_eval = -x if flip else x
+        try:
+            y = fn(x_eval)
+        except Exception:
+            break
+        if not math.isfinite(y):
+            break
+        px_local = x_eval * S.GRID_UNIT_PX
+        py_local = y * S.GRID_UNIT_PX
+        dx, dy = S.rotate_point(px_local, py_local, angle)
+        wx = px + dx
+        wy = py - dy
+        points.append((int(wx), int(wy)))
+        if wx < 0 or wx >= S.WIDTH:
+            break
+        x += step_grid
+    return points
+
+
 def main():
     if len(sys.argv) < 2:
         print("Использование: python3 client.py <ip сервера> [порт] [имя]")
@@ -214,6 +244,9 @@ def main():
     restart_voted = False
     restart_voters = (0, 0)
 
+    preview_points = []
+    preview_last_text = ""
+
     # анимация полёта снаряда
     anim_points = []
     anim_idx = 0
@@ -256,6 +289,20 @@ def main():
                 restart_voted = True
             else:
                 res = input_box.handle_event(ev)
+                if input_box.text != preview_last_text:
+                    preview_last_text = input_box.text
+                    can_preview = (state.get("started") and turn_id == net.my_id
+                                   and not game_over_msg and not choosing_spawn)
+                    if can_preview and preview_last_text.strip() and not preview_last_text.strip().startswith("move"):
+                        me = next((p for p in players if p["id"] == net.my_id), None)
+                        if me and me["alive"]:
+                            preview_points = _compute_preview(
+                                preview_last_text.strip(), me["x"], me["y"],
+                                me["angle"], flip_x)
+                        else:
+                            preview_points = []
+                    else:
+                        preview_points = []
                 if res == "submit" or (ev.type == pygame.MOUSEBUTTONDOWN and fire_btn.collidepoint(ev.pos)):
                     if input_box.text.strip():
                         txt = input_box.text.strip()
@@ -269,8 +316,16 @@ def main():
                         else:
                             net.send({"type": "fire", "expr": txt, "flip": flip_x})
                         input_box.text = ""
+                        preview_points = []
+                        preview_last_text = ""
                 if ev.type == pygame.MOUSEBUTTONDOWN and flip_btn.collidepoint(ev.pos):
                     flip_x = not flip_x
+                    if preview_last_text.strip() and state.get("started") and turn_id == net.my_id and not game_over_msg:
+                        me = next((p for p in players if p["id"] == net.my_id), None)
+                        if me and me["alive"]:
+                            preview_points = _compute_preview(
+                                preview_last_text.strip(), me["x"], me["y"],
+                                me["angle"], flip_x)
 
         for msg in net.poll():
             t = msg.get("type")
@@ -566,6 +621,28 @@ def main():
             blabel = {"damage": "DMG", "shield": "SHD", "double_shot": "x2", "angle_reset": "ANG"}.get(btype, "?")
             bsurf = font_small.render(blabel, True, (200, 130, 255))
             screen.blit(bsurf, (bx - bsurf.get_width() // 2, by - 7))
+
+        # предпоказ траектории
+        if preview_points and not anim_active and len(preview_points) >= 2:
+            _pv_col = (100, 140, 200)
+            _pv_dash, _pv_gap, _pv_w = 8, 5, 1
+            for _i in range(len(preview_points) - 1):
+                _sx, _sy = preview_points[_i]
+                _ex, _ey = preview_points[_i + 1]
+                _dx, _dy = _ex - _sx, _ey - _sy
+                _ln = math.hypot(_dx, _dy)
+                if _ln < 1:
+                    continue
+                _ux, _uy = _dx / _ln, _dy / _ln
+                _p = 0.0
+                while _p < _ln:
+                    _ax = _sx + _ux * _p
+                    _ay = _sy + _uy * _p
+                    _ep = min(_p + _pv_dash, _ln)
+                    _bx = _sx + _ux * _ep
+                    _by = _sy + _uy * _ep
+                    pygame.draw.line(screen, _pv_col, (int(_ax), int(_ay)), (int(_bx), int(_by)), _pv_w)
+                    _p += _pv_dash + _pv_gap
 
         # анимация полёта снаряда
         now = time.time()
