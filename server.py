@@ -48,6 +48,7 @@ class Player:
         self.lock = threading.Lock()
         self.bonus_effect = None       # активный эффект бонуса
         self.bonus_double_used = False # для double_shot: был ли первый выстрел
+        self.moved_this_turn = False   # переместился ли в этом ходу
 
     def send(self, msg):
         try:
@@ -255,6 +256,7 @@ class GameServer:
             p.angle = random.uniform(-math.pi, math.pi)
             p.bonus_effect = None
             p.bonus_double_used = False
+            p.moved_this_turn = False
         self.order = list(self.players.keys())
         random.shuffle(self.order)
         self.turn_idx = 0
@@ -319,6 +321,9 @@ class GameServer:
         if len(ids) <= 1:
             return
         self.turn_idx = (self.turn_idx + 1) % len(ids)
+        next_pid = ids[self.turn_idx]
+        if next_pid in self.players:
+            self.players[next_pid].moved_this_turn = False
         if self.turn_idx == 0:
             self.round_no += 1
             for pid in ids:
@@ -642,6 +647,9 @@ class GameServer:
             if self.current_turn_id() != p.id:
                 p.send({"type": "error", "msg": "Сейчас не ваш ход."})
                 return
+            if p.moved_this_turn:
+                p.send({"type": "error", "msg": "Вы уже переместились в этом ходу."})
+                return
             self._apply_turn_effects(p)
             d2 = dx * dx + dy * dy
             if d2 >= 8:
@@ -662,7 +670,18 @@ class GameServer:
             self.log(f"{p.name} переместился на ({dx:.1f}, {dy:.1f}).")
             self._cancel_turn_timer()
             p.x, p.y = nx, ny
+            p.moved_this_turn = True
             self._try_pickup_bonus(nx, ny)
+            self.broadcast_state()
+            self._start_turn_timer()
+
+    def handle_end_turn(self, p):
+        with self.lock:
+            if not self.started or self.game_over:
+                return
+            if self.current_turn_id() != p.id:
+                return
+            self._cancel_turn_timer()
             self.advance_turn()
             self.check_game_over()
             if self.started and not self.game_over:
@@ -676,8 +695,6 @@ class GameServer:
             if self.started and not self.game_over:
                 conn.close()
                 return
-            if self.game_over:
-                self.reset_game()
             pid = self.next_id
             self.next_id += 1
         name = f"Player{pid}"
@@ -720,6 +737,8 @@ class GameServer:
                     self.handle_move(p, float(msg.get("dx", 0)), float(msg.get("dy", 0)))
                 elif msg.get("type") == "restart_vote":
                     self.handle_restart_vote(p)
+                elif msg.get("type") == "end_turn":
+                    self.handle_end_turn(p)
         except Exception:
             pass
         finally:
@@ -727,7 +746,7 @@ class GameServer:
                 if pid in self.players:
                     self.players.pop(pid)
                     self.log(f"{p.name} отключился.")
-                if self.started:
+                if self.started and not self.game_over:
                     if not self.players:
                         try:
                             self.reset_game()
