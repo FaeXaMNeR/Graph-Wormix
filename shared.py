@@ -30,6 +30,7 @@ BONUS_TYPES = ["damage", "shield", "double_shot", "angle_reset"]
 BONUS_SIZE = 16                      # ширина квадрата бонуса, px
 BONUS_PICKUP_RADIUS = 30             # радиус подбора бонуса выстрелом, px
 
+MOVE_MAX_R2 = 8                          # dx² + dy² < 8
 PROTOCOL_PORT_DEFAULT = 5555
 
 

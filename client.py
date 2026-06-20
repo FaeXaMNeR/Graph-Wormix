@@ -36,6 +36,8 @@ AXIS_X_COLOR = (90, 170, 255)
 AXIS_Y_COLOR = (255, 150, 90)
 TRAJ_COLOR = (255, 230, 80)
 EXPLOSION_COLOR = (255, 100, 40)
+MOVE_RADIUS_COLOR = (80, 200, 180)
+MOVE_DEST_COLOR = (80, 255, 180)
 
 PLAYER_COLORS = [
     (220, 70, 70), (70, 160, 230), (90, 210, 100),
@@ -165,6 +167,40 @@ def _compute_preview(expr, px, py, angle, flip):
     return points
 
 
+def _parse_move(text):
+    parts = text.strip().split()
+    if len(parts) < 2 or parts[0].lower() != "move":
+        return None, None
+    if len(parts) == 2:
+        try:
+            dx = float(parts[1])
+            return (dx, 0.0)
+        except ValueError:
+            return None, None
+    if len(parts) == 3:
+        try:
+            dx, dy = float(parts[1]), float(parts[2])
+            return (dx, dy)
+        except ValueError:
+            return None, None
+    return None, None
+
+
+def _move_dest_screen(dx, dy, px, py, angle):
+    local_px = dx * S.GRID_UNIT_PX
+    local_py = dy * S.GRID_UNIT_PX
+    wx, wy = S.rotate_point(local_px, local_py, angle)
+    return (int(px + wx), int(py - wy))
+
+
+def _circle_points(cx, cy, r, segments=80):
+    pts = []
+    for i in range(segments + 1):
+        a = 2 * math.pi * i / segments
+        pts.append((int(cx + r * math.cos(a)), int(cy + r * math.sin(a))))
+    return pts
+
+
 def main():
     if len(sys.argv) < 2:
         print("Использование: python3 client.py <ip сервера> [порт] [имя]")
@@ -247,6 +283,10 @@ def main():
     preview_points = []
     preview_last_text = ""
 
+    move_preview_dx = None
+    move_preview_dy = None
+    move_preview_has_coords = False
+
     # анимация полёта снаряда
     anim_points = []
     anim_idx = 0
@@ -293,14 +333,30 @@ def main():
                     preview_last_text = input_box.text
                     can_preview = (state.get("started") and turn_id == net.my_id
                                    and not game_over_msg and not choosing_spawn)
-                    if can_preview and preview_last_text.strip() and not preview_last_text.strip().startswith("move"):
-                        me = next((p for p in players if p["id"] == net.my_id), None)
-                        if me and me["alive"]:
-                            preview_points = _compute_preview(
-                                preview_last_text.strip(), me["x"], me["y"],
-                                me["angle"], flip_x)
-                        else:
+                    move_preview_dx = None
+                    move_preview_dy = None
+                    move_preview_has_coords = False
+                    if can_preview and preview_last_text.strip():
+                        txt_stripped = preview_last_text.strip()
+                        if txt_stripped.lower().startswith("move"):
+                            move_dx, move_dy = _parse_move(txt_stripped)
+                            if move_dx is not None:
+                                move_preview_dx = move_dx
+                                move_preview_dy = move_dy
+                                move_preview_has_coords = True
+                            else:
+                                move_preview_dx = 0.0
+                                move_preview_dy = 0.0
+                                move_preview_has_coords = False
                             preview_points = []
+                        else:
+                            me = next((p for p in players if p["id"] == net.my_id), None)
+                            if me and me["alive"]:
+                                preview_points = _compute_preview(
+                                    txt_stripped, me["x"], me["y"],
+                                    me["angle"], flip_x)
+                            else:
+                                preview_points = []
                     else:
                         preview_points = []
                 if res == "submit" or (ev.type == pygame.MOUSEBUTTONDOWN and fire_btn.collidepoint(ev.pos)):
@@ -318,6 +374,9 @@ def main():
                         input_box.text = ""
                         preview_points = []
                         preview_last_text = ""
+                        move_preview_dx = None
+                        move_preview_dy = None
+                        move_preview_has_coords = False
                 if ev.type == pygame.MOUSEBUTTONDOWN and flip_btn.collidepoint(ev.pos):
                     flip_x = not flip_x
                     if preview_last_text.strip() and state.get("started") and turn_id == net.my_id and not game_over_msg:
@@ -643,6 +702,38 @@ def main():
                     _by = _sy + _uy * _ep
                     pygame.draw.line(screen, _pv_col, (int(_ax), int(_ay)), (int(_bx), int(_by)), _pv_w)
                     _p += _pv_dash + _pv_gap
+
+        # предпоказ перемещения
+        if move_preview_dx is not None and not anim_active and _active:
+            _mpx, _mpy = _active["x"], _active["y"]
+            _mangle = _active["angle"]
+            _max_r_px = math.sqrt(S.MOVE_MAX_R2) * S.GRID_UNIT_PX
+            _pulse = (math.sin(time.time() * 3) + 1) / 2
+            _alpha_r = int(60 + 40 * _pulse)
+            _circ_surf = pygame.Surface((S.WIDTH, S.HEIGHT), pygame.SRCALPHA)
+            _circle_pts = _circle_points(_mpx, _mpy, _max_r_px)
+            for _ci in range(len(_circle_pts) - 1):
+                pygame.draw.line(_circ_surf, (MOVE_RADIUS_COLOR[0], MOVE_RADIUS_COLOR[1], MOVE_RADIUS_COLOR[2], _alpha_r),
+                                 _circle_pts[_ci], _circle_pts[_ci + 1], 2)
+            _fill_surf = pygame.Surface((S.WIDTH, S.HEIGHT), pygame.SRCALPHA)
+            pygame.draw.polygon(_fill_surf, (MOVE_RADIUS_COLOR[0], MOVE_RADIUS_COLOR[1], MOVE_RADIUS_COLOR[2], 15), _circle_pts)
+            screen.blit(_fill_surf, (0, 0))
+            screen.blit(_circ_surf, (0, 0))
+            if move_preview_has_coords:
+                _dest = _move_dest_screen(move_preview_dx, move_preview_dy, _mpx, _mpy, _mangle)
+                _dest_pulse = (math.sin(time.time() * 5) + 1) / 2
+                _dest_r = int(5 + 3 * _dest_pulse)
+                pygame.draw.circle(screen, MOVE_DEST_COLOR, _dest, _dest_r)
+                pygame.draw.circle(screen, (255, 255, 255), _dest, _dest_r, width=1)
+                _valid = (move_preview_dx ** 2 + move_preview_dy ** 2) < S.MOVE_MAX_R2
+                _dest_col = MOVE_DEST_COLOR if _valid else (255, 80, 80)
+                _dest_label = f"({move_preview_dx:.1f}, {move_preview_dy:.1f})"
+                _dest_surf = font_small.render(_dest_label, True, _dest_col)
+                screen.blit(_dest_surf, (_dest[0] + 10, _dest[1] - 10))
+                _line_col = (MOVE_DEST_COLOR[0], MOVE_DEST_COLOR[1], MOVE_DEST_COLOR[2], 100) if _valid else (255, 80, 80, 100)
+                _line_surf = pygame.Surface((S.WIDTH, S.HEIGHT), pygame.SRCALPHA)
+                pygame.draw.line(_line_surf, _line_col, (int(_mpx), int(_mpy)), _dest, 1)
+                screen.blit(_line_surf, (0, 0))
 
         # анимация полёта снаряда
         now = time.time()
